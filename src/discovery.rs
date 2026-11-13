@@ -351,7 +351,10 @@ pub fn default_socket_candidates() -> Vec<PathBuf> {
     }
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
-            out.push(PathBuf::from(home).join(".local/state/rex/run/server.sock"));
+            let home_path = PathBuf::from(home);
+            out.push(home_path.join(".local/state/rex/run/server.sock"));
+            #[cfg(target_os = "macos")]
+            out.push(home_path.join("Library/Application Support/rex/run/server.sock"));
         }
     }
     out

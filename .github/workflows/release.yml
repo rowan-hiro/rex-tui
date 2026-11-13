@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: rex-tui-linux-amd64.tar.gz
+            run_tests: true
+          - platform: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: rex-tui-linux-aarch64.tar.gz
+            run_tests: false
+          - platform: darwin-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            asset: rex-tui-darwin-aarch64.tar.gz
+            run_tests: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Linux musl & cross toolchains
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.platform }}" = "linux-aarch64" ]; then
+            sudo apt-get install -y --no-install-recommends musl-tools gcc-aarch64-linux-gnu
+          else
+            sudo apt-get install -y --no-install-recommends musl-tools
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: Run unit tests
+        if: matrix.run_tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary archive
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.asset }}" -C "target/${{ matrix.target }}/release" rex-tui
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.platform }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Package source.tar.gz and checksums
+        run: |
+          mkdir -p dist
+          TAG="${{ inputs.tag || github.ref_name }}"
+          PREFIX="rex-tui-${TAG#v}"
+          git archive --format=tar.gz --prefix="${PREFIX}/" -o dist/source.tar.gz HEAD
+          cd dist
+          sha256sum source.tar.gz rex-tui-*.tar.gz > SHA256SUMS
+          ls -lh
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release via gh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --title "$TAG" \
+              --generate-notes
+          fi
