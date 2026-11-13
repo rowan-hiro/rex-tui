@@ -1,19 +1,25 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
+#[cfg(unix)]
 static TUNNEL_SEQ: AtomicU64 = AtomicU64::new(1);
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportKind {
     Local,
     Unix,
+    Pipe,
     Http,
     Ssh,
 }
@@ -23,6 +29,7 @@ impl TransportKind {
         match self {
             TransportKind::Local => "LOCAL",
             TransportKind::Unix => "UNIX",
+            TransportKind::Pipe => "PIPE",
             TransportKind::Http => "HTTP",
             TransportKind::Ssh => "SSH",
         }
@@ -31,13 +38,16 @@ impl TransportKind {
 
 #[derive(Debug, Clone)]
 pub enum ConnectTarget {
+    #[cfg(unix)]
     Unix(PathBuf),
+    #[cfg(windows)]
+    NamedPipe(String),
     Tcp { addr: String, host_header: String },
 }
 
 pub struct SshTunnelGuard {
     child: Mutex<Option<Child>>,
-    local_socket: PathBuf,
+    local_socket: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for SshTunnelGuard {
@@ -55,7 +65,9 @@ impl Drop for SshTunnelGuard {
                 let _ = child.start_kill();
             }
         }
-        let _ = std::fs::remove_file(&self.local_socket);
+        if let Some(ref sock) = self.local_socket {
+            let _ = std::fs::remove_file(sock);
+        }
     }
 }
 
@@ -81,9 +93,13 @@ pub struct HostItem {
 
 impl HostItem {
     pub fn local() -> Self {
+        #[cfg(unix)]
+        let ep_desc = "本机 Unix Socket";
+        #[cfg(windows)]
+        let ep_desc = "本机 Named Pipe";
         Self {
             label: "local".to_string(),
-            endpoints: vec!["本机 Unix Socket".to_string()],
+            endpoints: vec![ep_desc.to_string()],
             is_local: true,
             is_adhoc: false,
         }
@@ -98,6 +114,8 @@ impl HostItem {
             "ssh"
         } else if first.starts_with("http://") || first.starts_with("ws://") {
             "http"
+        } else if parse_named_pipe_endpoint(first).is_some() {
+            "pipe"
         } else if first.starts_with("unix://") || first.starts_with('/') {
             "unix"
         } else {
@@ -164,11 +182,27 @@ pub struct ParsedSshEndpoint {
 pub fn parse_unix_endpoint(endpoint: &str) -> Option<PathBuf> {
     if let Some(rest) = endpoint.strip_prefix("unix://") {
         Some(PathBuf::from(rest))
-    } else if endpoint.starts_with('/') {
+    } else if endpoint.starts_with('/') && !endpoint.starts_with("//./pipe/") {
         Some(PathBuf::from(endpoint))
     } else {
         None
     }
+}
+
+pub fn parse_named_pipe_endpoint(endpoint: &str) -> Option<String> {
+    let trimmed = endpoint.trim();
+    let rest = trimmed.strip_prefix("npipe://").unwrap_or(trimmed);
+    if let Some(name) = rest.strip_prefix(r"\\.\pipe\") {
+        if !name.is_empty() {
+            return Some(format!(r"\\.\pipe\{}", name));
+        }
+    }
+    if let Some(name) = rest.strip_prefix("//./pipe/") {
+        if !name.is_empty() {
+            return Some(format!(r"\\.\pipe\{}", name.replace('/', r"\")));
+        }
+    }
+    None
 }
 
 pub fn parse_http_endpoint(raw: &str) -> Result<Option<ParsedHttpEndpoint>> {
@@ -337,6 +371,7 @@ fn validate_ssh_token(s: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 pub fn default_socket_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(rt) = std::env::var("REX_RUNTIME_DIR") {
@@ -360,6 +395,7 @@ pub fn default_socket_candidates() -> Vec<PathBuf> {
     out
 }
 
+#[cfg(unix)]
 async fn can_connect_unix(path: &Path) -> bool {
     tokio::net::UnixStream::connect(path).await.is_ok()
 }
@@ -408,6 +444,7 @@ pub async fn add_rex_host(label: &str, endpoints: &[String]) -> Result<()> {
     // Validate each endpoint syntax upfront
     for ep in endpoints {
         if parse_unix_endpoint(ep).is_none()
+            && parse_named_pipe_endpoint(ep).is_none()
             && parse_http_endpoint(ep)?.is_none()
             && parse_ssh_endpoint(ep)?.is_none()
         {
@@ -516,10 +553,16 @@ pub async fn resolve_host_item(
 
 async fn verify_target_reachable(target: &ConnectTarget) -> Result<()> {
     match target {
+        #[cfg(unix)]
         ConnectTarget::Unix(path) => {
             tokio::net::UnixStream::connect(path)
                 .await
                 .with_context(|| format!("无法连接 Unix Socket {}", path.display()))?;
+            Ok(())
+        }
+        #[cfg(windows)]
+        ConnectTarget::NamedPipe(pipe_name) => {
+            let _ = crate::client::open_named_pipe(pipe_name).await?;
             Ok(())
         }
         ConnectTarget::Tcp { addr, .. } => {
@@ -538,24 +581,61 @@ async fn try_resolve_single_endpoint(
     autostart: bool,
     in_tui: bool,
 ) -> Result<Option<ResolvedServer>> {
-    // A. Unix socket path
-    if let Some(sock) = parse_unix_endpoint(raw) {
-        if !can_connect_unix(&sock).await {
-            return Err(anyhow!("Unix Socket 不可用: {}", sock.display()));
+    // A1. Windows Named Pipe path (`\\.\pipe\...` or `npipe:////./pipe/...`)
+    if let Some(pipe) = parse_named_pipe_endpoint(raw) {
+        #[cfg(windows)]
+        {
+            let _ = crate::client::open_named_pipe(&pipe).await?;
+            let label = label_override
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "pipe".to_string());
+            return Ok(Some(ResolvedServer {
+                host_label: label,
+                transport_kind: TransportKind::Pipe,
+                endpoint_display: pipe.clone(),
+                target: ConnectTarget::NamedPipe(pipe),
+                server_pid: None,
+                rex_version: None,
+                platform: None,
+                _ssh_tunnel: None,
+            }));
         }
-        let label = label_override
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unix".to_string());
-        return Ok(Some(ResolvedServer {
-            host_label: label,
-            transport_kind: TransportKind::Unix,
-            endpoint_display: format!("unix://{}", sock.display()),
-            target: ConnectTarget::Unix(sock),
-            server_pid: None,
-            rex_version: None,
-            platform: None,
-            _ssh_tunnel: None,
-        }));
+        #[cfg(not(windows))]
+        {
+            let _ = (pipe, label_override);
+            return Err(anyhow!("当前系统不支持 Windows Named Pipe 地址: {}", raw));
+        }
+    }
+
+    // A2. Unix socket path (`unix:///...` or `/path/...`)
+    if let Some(sock) = parse_unix_endpoint(raw) {
+        #[cfg(unix)]
+        {
+            if !can_connect_unix(&sock).await {
+                return Err(anyhow!("Unix Socket 不可用: {}", sock.display()));
+            }
+            let label = label_override
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unix".to_string());
+            return Ok(Some(ResolvedServer {
+                host_label: label,
+                transport_kind: TransportKind::Unix,
+                endpoint_display: format!("unix://{}", sock.display()),
+                target: ConnectTarget::Unix(sock),
+                server_pid: None,
+                rex_version: None,
+                platform: None,
+                _ssh_tunnel: None,
+            }));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sock;
+            return Err(anyhow!(
+                "Windows 本机不支持直连 unix:// 地址 ({})，请使用 ssh:// 或 http:// 连接远程机器",
+                raw
+            ));
+        }
     }
 
     // B. HTTP / WS / host:port
@@ -587,6 +667,7 @@ async fn try_resolve_single_endpoint(
     Ok(None)
 }
 
+#[cfg(unix)]
 async fn resolve_local_only(autostart: bool) -> Result<ResolvedServer> {
     if let Ok(env_srv) = std::env::var("REX_SERVER") {
         if let Some(sock) = parse_unix_endpoint(&env_srv) {
@@ -639,8 +720,9 @@ async fn resolve_local_only(autostart: bool) -> Result<ResolvedServer> {
     let status: RexServerStatusJson = serde_json::from_slice(&output.stdout)
         .context("解析 `rex server status --json` 输出失败")?;
 
-    let sock = extract_unix_socket_from_status(&status)
+    let sock_str = extract_remote_unix_socket_str(&status)
         .ok_or_else(|| anyhow!("未在本地 Rex 服务状态中找到 Unix Socket ({})", status.endpoint))?;
+    let sock = PathBuf::from(&sock_str);
 
     Ok(ResolvedServer {
         host_label: "local".into(),
@@ -654,41 +736,114 @@ async fn resolve_local_only(autostart: bool) -> Result<ResolvedServer> {
     })
 }
 
-fn extract_unix_socket_from_status(status: &RexServerStatusJson) -> Option<PathBuf> {
-    if let Some(sock) = parse_unix_endpoint(&status.endpoint) {
-        return Some(sock);
+#[cfg(windows)]
+async fn resolve_local_only(autostart: bool) -> Result<ResolvedServer> {
+    if let Ok(env_srv) = std::env::var("REX_SERVER") {
+        if let Some(pipe) = parse_named_pipe_endpoint(&env_srv) {
+            if crate::client::open_named_pipe(&pipe).await.is_ok() {
+                return Ok(ResolvedServer {
+                    host_label: "local".into(),
+                    transport_kind: TransportKind::Local,
+                    endpoint_display: pipe.clone(),
+                    target: ConnectTarget::NamedPipe(pipe),
+                    server_pid: None,
+                    rex_version: None,
+                    platform: None,
+                    _ssh_tunnel: None,
+                });
+            }
+        }
+    }
+
+    let mut cmd = Command::new("rex");
+    if !autostart {
+        cmd.arg("--autostart=false");
+    }
+    cmd.args(["server", "status", "--json"]);
+
+    let output = cmd
+        .output()
+        .await
+        .context("执行 `rex server status --json` 失败（请确认本机已安装 rex，或使用 -S 连接远程主机）")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("本地 Rex 服务不可用: {}", stderr.trim()));
+    }
+
+    let status: RexServerStatusJson = serde_json::from_slice(&output.stdout)
+        .context("解析 `rex server status --json` 输出失败")?;
+
+    let pipe = extract_named_pipe_from_status(&status).ok_or_else(|| {
+        anyhow!(
+            "未在本地 Rex 服务状态中找到 Windows Named Pipe ({})",
+            status.endpoint
+        )
+    })?;
+
+    Ok(ResolvedServer {
+        host_label: "local".into(),
+        transport_kind: TransportKind::Local,
+        endpoint_display: pipe.clone(),
+        target: ConnectTarget::NamedPipe(pipe),
+        server_pid: status.pid,
+        rex_version: status.rex_version,
+        platform: None,
+        _ssh_tunnel: None,
+    })
+}
+
+fn extract_remote_unix_socket_str(status: &RexServerStatusJson) -> Option<String> {
+    if let Some(rest) = status.endpoint.strip_prefix("unix://") {
+        if !rest.is_empty() {
+            return Some(rest.to_string());
+        }
+    } else if status.endpoint.starts_with('/') && !status.endpoint.starts_with("//./pipe/") {
+        return Some(status.endpoint.clone());
     }
     for l in &status.listeners {
         if l.transport == "unix" && (l.primary || !l.addresses.is_empty()) {
             if let Some(addr) = l.addresses.first() {
-                return Some(PathBuf::from(addr));
+                if !addr.is_empty() {
+                    return Some(addr.clone());
+                }
             }
         }
     }
     None
 }
 
-fn ensure_short_tunnel_dir() -> Result<PathBuf> {
-    #[cfg(unix)]
-    let uid = unsafe { libc_geteuid() };
-    #[cfg(not(unix))]
-    let uid = std::process::id();
+#[cfg(windows)]
+fn extract_named_pipe_from_status(status: &RexServerStatusJson) -> Option<String> {
+    if let Some(pipe) = parse_named_pipe_endpoint(&status.endpoint) {
+        return Some(pipe);
+    }
+    for l in &status.listeners {
+        if l.transport == "named_pipe" && (l.primary || !l.addresses.is_empty()) {
+            if let Some(addr) = l.addresses.first() {
+                if let Some(pipe) = parse_named_pipe_endpoint(addr) {
+                    return Some(pipe);
+                }
+                if !addr.is_empty() {
+                    return Some(addr.clone());
+                }
+            }
+        }
+    }
+    None
+}
 
+#[cfg(unix)]
+fn ensure_short_tunnel_dir() -> Result<PathBuf> {
+    let uid = unsafe { libc_geteuid() };
     let dir = PathBuf::from(format!("/tmp/rex-tui-{}", uid));
     if !dir.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&dir)
-                .with_context(|| format!("创建 SSH 隧道临时目录失败: {}", dir.display()))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::create_dir_all(&dir)?;
-        }
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("创建 SSH 隧道临时目录失败: {}", dir.display()))?;
     }
     Ok(dir)
 }
@@ -707,8 +862,8 @@ async fn establish_ssh_tunnel(
     autostart: bool,
     in_tui: bool,
 ) -> Result<ResolvedServer> {
+    #[cfg(unix)]
     let tunnel_dir = ensure_short_tunnel_dir()?;
-    let control_path = tunnel_dir.join("cm-%C");
 
     // 1. Discover & auto-start remote Rex server via SSH, retrieving its Unix socket path
     let mut probe_cmd = Command::new("ssh");
@@ -718,14 +873,18 @@ async fn establish_ssh_tunnel(
     if in_tui {
         probe_cmd.args(["-o", "BatchMode=yes"]);
     } else {
-        probe_cmd.args([
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            &format!("ControlPath={}", control_path.display()),
-            "-o",
-            "ControlPersist=60s",
-        ]);
+        #[cfg(unix)]
+        {
+            let control_path = tunnel_dir.join("cm-%C");
+            probe_cmd.args([
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                &format!("ControlPath={}", control_path.display()),
+                "-o",
+                "ControlPersist=60s",
+            ]);
+        }
     }
     probe_cmd.args(["-o", "ConnectTimeout=10", "--", &ssh.destination]);
 
@@ -764,7 +923,7 @@ async fn establish_ssh_tunnel(
             )
         })?;
 
-    let remote_sock = extract_unix_socket_from_status(&remote_status).ok_or_else(|| {
+    let remote_sock = extract_remote_unix_socket_str(&remote_status).ok_or_else(|| {
         anyhow!(
             "远程主机 {} 未报告可用的 Unix Socket (endpoint={})",
             ssh.display,
@@ -772,84 +931,166 @@ async fn establish_ssh_tunnel(
         )
     })?;
 
-    // 2. Spawn persistent `ssh -N -L <local_sock>:<remote_sock>` Unix domain socket forward
-    let seq = TUNNEL_SEQ.fetch_add(1, Ordering::Relaxed);
-    let local_sock = tunnel_dir.join(format!("tun-{}-{}.sock", std::process::id(), seq));
-    let _ = std::fs::remove_file(&local_sock);
+    // 2. Spawn persistent `ssh -N -L ...` forward to the remote Unix domain socket
+    #[cfg(unix)]
+    let (target, guard) = {
+        let seq = TUNNEL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let local_sock = tunnel_dir.join(format!("tun-{}-{}.sock", std::process::id(), seq));
+        let _ = std::fs::remove_file(&local_sock);
 
-    let forward_spec = format!("{}:{}", local_sock.display(), remote_sock.display());
-    let mut tun_cmd = Command::new("ssh");
-    tun_cmd.arg("-N");
-    if let Some(port) = ssh.port {
-        tun_cmd.arg("-p").arg(port.to_string());
-    }
-    if in_tui {
-        tun_cmd.args(["-o", "BatchMode=yes"]);
-    } else {
-        tun_cmd.args([
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            &format!("ControlPath={}", control_path.display()),
-        ]);
-    }
-    tun_cmd
-        .args([
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "StreamLocalBindUnlink=yes",
-            "-o",
-            "StreamLocalBindMask=0177",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "ConnectTimeout=10",
-            "-L",
-            &forward_spec,
-            "--",
-            &ssh.destination,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = tun_cmd
-        .spawn()
-        .with_context(|| format!("启动 SSH 隧道进程失败 ({})", ssh.display))?;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-    loop {
-        if can_connect_unix(&local_sock).await {
-            break;
+        let forward_spec = format!("{}:{}", local_sock.display(), remote_sock);
+        let mut tun_cmd = Command::new("ssh");
+        tun_cmd.arg("-N");
+        if let Some(port) = ssh.port {
+            tun_cmd.arg("-p").arg(port.to_string());
         }
-        if let Some(exit_status) = child.try_wait()? {
-            let mut err_buf = String::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_string(&mut err_buf).await;
+        if in_tui {
+            tun_cmd.args(["-o", "BatchMode=yes"]);
+        } else {
+            let control_path = tunnel_dir.join("cm-%C");
+            tun_cmd.args([
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                &format!("ControlPath={}", control_path.display()),
+            ]);
+        }
+        tun_cmd
+            .args([
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "StreamLocalBindUnlink=yes",
+                "-o",
+                "StreamLocalBindMask=0177",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ConnectTimeout=10",
+                "-L",
+                &forward_spec,
+                "--",
+                &ssh.destination,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = tun_cmd
+            .spawn()
+            .with_context(|| format!("启动 SSH 隧道进程失败 ({})", ssh.display))?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            if can_connect_unix(&local_sock).await {
+                break;
             }
-            let _ = std::fs::remove_file(&local_sock);
-            return Err(anyhow!(
-                "SSH 隧道异常退出 ({}): {}",
-                exit_status,
-                err_buf.trim()
-            ));
+            if let Some(exit_status) = child.try_wait()? {
+                let mut err_buf = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut err_buf).await;
+                }
+                let _ = std::fs::remove_file(&local_sock);
+                return Err(anyhow!(
+                    "SSH 隧道异常退出 ({}): {}",
+                    exit_status,
+                    err_buf.trim()
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = child.start_kill();
+                let _ = std::fs::remove_file(&local_sock);
+                return Err(anyhow!("等待 SSH Unix Socket 隧道就绪超时 ({})", ssh.display));
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            let _ = child.start_kill();
-            let _ = std::fs::remove_file(&local_sock);
-            return Err(anyhow!("等待 SSH Unix Socket 隧道就绪超时 ({})", ssh.display));
-        }
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
 
-    let guard = Arc::new(SshTunnelGuard {
-        child: Mutex::new(Some(child)),
-        local_socket: local_sock.clone(),
-    });
+        let guard = Arc::new(SshTunnelGuard {
+            child: Mutex::new(Some(child)),
+            local_socket: Some(local_sock.clone()),
+        });
+        (ConnectTarget::Unix(local_sock), guard)
+    };
+
+    #[cfg(windows)]
+    let (target, guard) = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .context("无法在 127.0.0.1 上分配本地 SSH 转发端口")?;
+        let local_port = listener.local_addr()?.port();
+        drop(listener);
+
+        let local_addr = format!("127.0.0.1:{}", local_port);
+        let forward_spec = format!("{}:{}", local_addr, remote_sock);
+        let mut tun_cmd = Command::new("ssh");
+        tun_cmd.arg("-N");
+        if let Some(port) = ssh.port {
+            tun_cmd.arg("-p").arg(port.to_string());
+        }
+        if in_tui {
+            tun_cmd.args(["-o", "BatchMode=yes"]);
+        }
+        tun_cmd
+            .args([
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ConnectTimeout=10",
+                "-L",
+                &forward_spec,
+                "--",
+                &ssh.destination,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = tun_cmd
+            .spawn()
+            .with_context(|| format!("启动 SSH 隧道进程失败 ({})", ssh.display))?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            if tokio::net::TcpStream::connect(&local_addr).await.is_ok() {
+                break;
+            }
+            if let Some(exit_status) = child.try_wait()? {
+                let mut err_buf = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut err_buf).await;
+                }
+                return Err(anyhow!(
+                    "SSH 隧道异常退出 ({}): {}",
+                    exit_status,
+                    err_buf.trim()
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = child.start_kill();
+                return Err(anyhow!("等待 SSH 本地转发端口就绪超时 ({})", ssh.display));
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        let guard = Arc::new(SshTunnelGuard {
+            child: Mutex::new(Some(child)),
+            local_socket: None,
+        });
+        (
+            ConnectTarget::Tcp {
+                addr: local_addr,
+                host_header: "localhost".to_string(),
+            },
+            guard,
+        )
+    };
 
     let label = label_override
         .map(|s| s.to_string())
@@ -859,7 +1100,7 @@ async fn establish_ssh_tunnel(
         host_label: label,
         transport_kind: TransportKind::Ssh,
         endpoint_display: ssh.display.clone(),
-        target: ConnectTarget::Unix(local_sock),
+        target,
         server_pid: remote_status.pid,
         rex_version: remote_status.rex_version,
         platform: None,
@@ -910,5 +1151,19 @@ mod tests {
 
         // Reject option injection
         assert!(parse_ssh_endpoint("ssh://-oProxyCommand=evil").is_err());
+    }
+
+    #[test]
+    fn test_parse_named_pipe_endpoints() {
+        assert_eq!(
+            parse_named_pipe_endpoint(r"\\.\pipe\rex-default"),
+            Some(r"\\.\pipe\rex-default".to_string())
+        );
+        assert_eq!(
+            parse_named_pipe_endpoint("npipe:////./pipe/rex/server"),
+            Some(r"\\.\pipe\rex\server".to_string())
+        );
+        assert_eq!(parse_named_pipe_endpoint("/tmp/rex.sock"), None);
+        assert_eq!(parse_unix_endpoint("//./pipe/rex"), None);
     }
 }

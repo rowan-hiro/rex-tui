@@ -16,7 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, UnixStream};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::handshake::client::{generate_key, Request};
 use tokio_tungstenite::tungstenite::Message;
@@ -25,16 +29,45 @@ pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 pub type BoxedStream = Pin<Box<dyn IoStream>>;
 
+#[cfg(windows)]
+pub(crate) async fn open_named_pipe(
+    pipe_name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(client) => return Ok(client),
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("无法连接 Windows Named Pipe: {}", pipe_name));
+            }
+        }
+    }
+}
+
 async fn open_target_ws(
     target: &ConnectTarget,
     api_path: &str,
     subprotocol: &str,
 ) -> Result<tokio_tungstenite::WebSocketStream<BoxedStream>> {
     let (stream, host_header): (BoxedStream, String) = match target {
+        #[cfg(unix)]
         ConnectTarget::Unix(path) => {
             let s = UnixStream::connect(path)
                 .await
                 .with_context(|| format!("无法连接 Unix Socket: {}", path.display()))?;
+            (Box::pin(s), "localhost".to_string())
+        }
+        #[cfg(windows)]
+        ConnectTarget::NamedPipe(pipe_name) => {
+            let s = open_named_pipe(pipe_name).await?;
             (Box::pin(s), "localhost".to_string())
         }
         ConnectTarget::Tcp { addr, host_header } => {

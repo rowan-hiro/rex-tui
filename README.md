@@ -4,10 +4,10 @@
 
 ## 功能特性 (v0.2)
 
-- **本地与远程多协议连接**：
-  - **本机 (`local` / `unix://`)**：自动检测本地 Rex Unix Socket（`REX_RUNTIME_DIR`、`XDG_STATE_HOME`、`~/.local/state/rex/run/server.sock`），未运行时自动通过 `rex server status` 拉起。
+- **本地与远程多协议连接（支持 Linux / macOS / Windows）**：
+  - **本机 (`local` / `unix://` / Windows `Named Pipe`)**：在 Linux/macOS 自动检测本地 Rex Unix Socket（`REX_RUNTIME_DIR`、`XDG_STATE_HOME`、`~/.local/state/rex/run/server.sock` 等），在 Windows 自动连接本地 Rex Named Pipe（`\\.\pipe\...`），未运行时自动通过 `rex server status` 拉起。
   - **远程 HTTP (`http://host[:port]` / `host:port`)**：基于原生 TCP WebSocket 直连局域网或 Tailscale 上的远程 Rex 服务（无需中转进程）。
-  - **远程 SSH (`ssh://[user@]host[:port]`)**：复用本机 OpenSSH 配置（`~/.ssh/config`、公钥/`ssh-agent`），自动探测或拉起远端 `rex` 服务，并建立加密的 Unix Domain Socket 隧道（断开或切走主机时自动回收隧道进程与临时 Socket）。
+  - **远程 SSH (`ssh://[user@]host[:port]`)**：复用本机 OpenSSH 配置（`~/.ssh/config`、公钥/`ssh-agent`），自动探测或拉起远端 `rex` 服务，并建立加密转发隧道（Linux/macOS 使用本地 Unix Socket 隧道，Windows 使用本机回环端口直连远端 Unix Socket；断开或切走主机时自动回收隧道进程）。
   - **兼容 `rex hosts` 主机配置**：自动读取 `rex hosts` 保存的远程主机列表，支持多地址按序故障回退（例如优先 Tailscale HTTP，回退 SSH）。
 - **多主机管理与无缝切换**：
   - 顶部内置 **主机切换栏 (Host Bar)**，支持鼠标点击、`[` / `]` 键快速轮换主机

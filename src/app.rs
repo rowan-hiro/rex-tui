@@ -264,15 +264,11 @@ impl App {
         if let Some(prev) = self.connecting.take() {
             prev.task.abort();
         }
-        let desc = if item.is_local {
-            "local (本机 Unix Socket)".to_string()
-        } else {
-            format!(
-                "{} ({})",
-                item.label,
-                item.endpoints.first().cloned().unwrap_or_default()
-            )
-        };
+        let desc = format!(
+            "{} ({})",
+            item.label,
+            item.endpoints.first().cloned().unwrap_or_default()
+        );
         let autostart = self.autostart;
         let tx = self.internal_tx.clone();
         let item_clone = item.clone();

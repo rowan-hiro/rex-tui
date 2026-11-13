@@ -19,7 +19,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 fn transport_color(kind: &TransportKind) -> Color {
     match kind {
-        TransportKind::Local | TransportKind::Unix => Color::Cyan,
+        TransportKind::Local | TransportKind::Unix | TransportKind::Pipe => Color::Cyan,
         TransportKind::Http => Color::LightGreen,
         TransportKind::Ssh => Color::LightMagenta,
     }
@@ -1173,7 +1173,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, attached: bool) {
             Line::from("  q 或 Esc          退出 rex-tui（后台会话保持运行）"),
             Line::from(""),
             Line::from(Span::styled(
-                "支持协议：本机 Unix Socket、http://host:port、ssh://[user@]host[:port]",
+                "支持协议：本机 (Unix Socket / Named Pipe)、http://host:port、ssh://[user@]host[:port]",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
