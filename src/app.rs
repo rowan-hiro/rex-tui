@@ -1,5 +1,8 @@
-use crate::client::{spawn_terminal_stream, RexClient, TerminalStreamEvent};
-use crate::discovery::ResolvedServer;
+use crate::client::{run_terminal_stream, RexClient, TerminalStreamEvent};
+use crate::discovery::{
+    add_rex_host, load_host_items, remove_rex_host, resolve_host_item, resolve_server, HostItem,
+    ResolvedServer, TransportKind,
+};
 use crate::input::{encode_key_to_vt, encode_paste_to_vt};
 use crate::layout::{compute_window_panes, PanePlacement};
 use crate::terminal_pane::TerminalPane;
@@ -14,6 +17,7 @@ use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
 pub enum ManagerModal {
@@ -30,7 +34,28 @@ pub enum ManagerModal {
         session_id: String,
         label: String,
     },
+    HostSwitcher {
+        selected: usize,
+    },
+    AddHost {
+        label: String,
+        endpoint: String,
+        focus_field: u8, // 0 = label, 1 = endpoint
+        connect_now: bool,
+    },
+    QuickConnect {
+        endpoint: String,
+    },
+    ConfirmDeleteHost {
+        label: String,
+        is_adhoc: bool,
+    },
     Help,
+}
+
+pub struct ConnectingState {
+    pub description: String,
+    pub task: JoinHandle<()>,
 }
 
 pub struct AttachedState {
@@ -50,15 +75,33 @@ pub enum AppMode {
 }
 
 enum InternalMsg {
-    SessionViewLoaded(SessionView),
+    SessionViewLoaded {
+        host_label: String,
+        view: SessionView,
+    },
     AttachedViewUpdated(SessionView),
     StatusError(String),
+    StatusInfo(String),
     AttachReady(SessionView),
+    HostsReloaded(Vec<HostItem>),
+    HostConnected {
+        server: ResolvedServer,
+        client: RexClient,
+        event_rx: mpsc::UnboundedReceiver<RexEvent>,
+        sessions: Vec<SessionSummary>,
+        adhoc_item: Option<HostItem>,
+    },
+    HostConnectFailed(String),
 }
 
 pub struct App {
     pub server: ResolvedServer,
     pub client: RexClient,
+    pub autostart: bool,
+    pub hosts: Vec<HostItem>,
+    pub host_hitboxes: Vec<(u16, u16, usize)>, // (x0, x1, host_index) in row 3
+    pub connecting: Option<ConnectingState>,
+
     pub sessions: Vec<SessionSummary>,
     pub selected_idx: usize,
     pub session_previews: HashMap<String, SessionView>,
@@ -73,45 +116,70 @@ pub struct App {
     stream_rx: mpsc::UnboundedReceiver<(String, TerminalStreamEvent)>,
     internal_tx: mpsc::UnboundedSender<InternalMsg>,
     internal_rx: mpsc::UnboundedReceiver<InternalMsg>,
-    write_tx: mpsc::UnboundedSender<(String, String, String)>,
+    write_tx: mpsc::UnboundedSender<(RexClient, String, String, String)>,
 }
 
 impl App {
     pub async fn new(
-        server: ResolvedServer,
+        mut server: ResolvedServer,
         client: RexClient,
         event_rx: mpsc::UnboundedReceiver<RexEvent>,
         initial_session: Option<&str>,
+        autostart: bool,
     ) -> Result<Self> {
+        if server.server_pid.is_none() || server.rex_version.is_none() {
+            let (pid, ver, plat) = client.fetch_server_metadata().await;
+            if server.server_pid.is_none() {
+                server.server_pid = pid;
+            }
+            if server.rex_version.is_none() {
+                server.rex_version = ver;
+            }
+            if server.platform.is_none() {
+                server.platform = plat;
+            }
+        }
+
         let sessions = client.attach_all().await?;
+        let mut hosts = load_host_items().await;
+        if server.transport_kind != TransportKind::Local
+            && !hosts
+                .iter()
+                .any(|h| h.label.eq_ignore_ascii_case(&server.host_label))
+        {
+            hosts.push(HostItem {
+                label: server.host_label.clone(),
+                endpoints: vec![server.endpoint_display.clone()],
+                is_local: false,
+                is_adhoc: true,
+            });
+        }
+
         let (stream_tx, stream_rx) = mpsc::unbounded_channel();
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<(String, String, String)>();
+        let (write_tx, mut write_rx) =
+            mpsc::unbounded_channel::<(RexClient, String, String, String)>();
 
-        // Sequential + coalescing terminal input writer task:
-        // Rex runs `com.superlogical.terminal.write` concurrently unless calls wait for the
-        // previous response or coalesce bursts into a single call.
-        let writer_client = client.clone();
+        // Sequential + coalescing terminal input writer task across any active RexClient
         tokio::spawn(async move {
-            let mut buffered_next: Option<(String, String, String)> = None;
+            let mut buffered_next: Option<(RexClient, String, String, String)> = None;
             loop {
-                let (sid, bid, mut batch) = match buffered_next.take() {
+                let (wclient, sid, bid, mut batch) = match buffered_next.take() {
                     Some(item) => item,
                     None => match write_rx.recv().await {
                         Some(item) => item,
                         None => break,
                     },
                 };
-                // Coalesce any immediately queued keystrokes targeting the same block
-                while let Ok((nsid, nbid, ndata)) = write_rx.try_recv() {
+                while let Ok((nc, nsid, nbid, ndata)) = write_rx.try_recv() {
                     if nsid == sid && nbid == bid && batch.len() + ndata.len() < 65536 {
                         batch.push_str(&ndata);
                     } else {
-                        buffered_next = Some((nsid, nbid, ndata));
+                        buffered_next = Some((nc, nsid, nbid, ndata));
                         break;
                     }
                 }
-                let _ = writer_client.terminal_write(&sid, &bid, &batch).await;
+                let _ = wclient.terminal_write(&sid, &bid, &batch).await;
             }
         });
 
@@ -120,6 +188,10 @@ impl App {
         let mut app = Self {
             server,
             client,
+            autostart,
+            hosts,
+            host_hitboxes: Vec::new(),
+            connecting: None,
             sessions,
             selected_idx: 0,
             session_previews: HashMap::new(),
@@ -140,7 +212,8 @@ impl App {
             if let Some(found) = app.find_session_by_query(target) {
                 app.attach_to_session(&found.session_id).await?;
             } else {
-                app.status_msg = Some((format!("未找到会话 \"{}\"，已打开会话管理列表", target), true));
+                app.status_msg =
+                    Some((format!("未找到会话 \"{}\"，已打开会话管理列表", target), true));
                 app.request_selected_preview();
             }
         } else {
@@ -150,15 +223,166 @@ impl App {
         Ok(app)
     }
 
+    pub fn active_host_index(&self) -> usize {
+        if self.server.transport_kind == TransportKind::Local {
+            return 0;
+        }
+        self.hosts
+            .iter()
+            .position(|h| {
+                !h.is_local
+                    && (h.label.eq_ignore_ascii_case(&self.server.host_label)
+                        || h.endpoints
+                            .iter()
+                            .any(|ep| ep == &self.server.endpoint_display))
+            })
+            .unwrap_or(0)
+    }
+
+    fn merge_loaded_hosts(&mut self, mut new_hosts: Vec<HostItem>) {
+        for existing in &self.hosts {
+            if existing.is_adhoc
+                && !new_hosts
+                    .iter()
+                    .any(|h| h.label.eq_ignore_ascii_case(&existing.label))
+            {
+                new_hosts.push(existing.clone());
+            }
+        }
+        self.hosts = new_hosts;
+    }
+
+    fn reload_hosts_bg(&self) {
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let items = load_host_items().await;
+            let _ = tx.send(InternalMsg::HostsReloaded(items));
+        });
+    }
+
+    fn start_connect_host_item(&mut self, item: HostItem) {
+        if let Some(prev) = self.connecting.take() {
+            prev.task.abort();
+        }
+        let desc = if item.is_local {
+            "local (本机 Unix Socket)".to_string()
+        } else {
+            format!(
+                "{} ({})",
+                item.label,
+                item.endpoints.first().cloned().unwrap_or_default()
+            )
+        };
+        let autostart = self.autostart;
+        let tx = self.internal_tx.clone();
+        let item_clone = item.clone();
+
+        let task = tokio::spawn(async move {
+            let res: Result<_> = async {
+                let mut srv = resolve_host_item(&item_clone, autostart, true).await?;
+                let (client, event_rx) = RexClient::connect(srv.target.clone()).await?;
+                if srv.server_pid.is_none() || srv.rex_version.is_none() {
+                    let (pid, ver, plat) = client.fetch_server_metadata().await;
+                    if srv.server_pid.is_none() {
+                        srv.server_pid = pid;
+                    }
+                    if srv.rex_version.is_none() {
+                        srv.rex_version = ver;
+                    }
+                    srv.platform = plat;
+                }
+                let sessions = client.attach_all().await?;
+                let adhoc = item_clone.is_adhoc.then_some(item_clone);
+                Ok((srv, client, event_rx, sessions, adhoc))
+            }
+            .await;
+
+            match res {
+                Ok((server, client, event_rx, sessions, adhoc_item)) => {
+                    let _ = tx.send(InternalMsg::HostConnected {
+                        server,
+                        client,
+                        event_rx,
+                        sessions,
+                        adhoc_item,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(InternalMsg::HostConnectFailed(format!("{:#}", e)));
+                }
+            }
+        });
+
+        self.connecting = Some(ConnectingState {
+            description: desc,
+            task,
+        });
+    }
+
+    fn start_connect_adhoc(&mut self, endpoint: String) {
+        let trimmed = endpoint.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Some(prev) = self.connecting.take() {
+            prev.task.abort();
+        }
+        let autostart = self.autostart;
+        let tx = self.internal_tx.clone();
+        let desc = trimmed.clone();
+
+        let task = tokio::spawn(async move {
+            let res: Result<_> = async {
+                let mut srv = resolve_server(Some(&trimmed), autostart, true).await?;
+                let (client, event_rx) = RexClient::connect(srv.target.clone()).await?;
+                if srv.server_pid.is_none() || srv.rex_version.is_none() {
+                    let (pid, ver, plat) = client.fetch_server_metadata().await;
+                    if srv.server_pid.is_none() {
+                        srv.server_pid = pid;
+                    }
+                    if srv.rex_version.is_none() {
+                        srv.rex_version = ver;
+                    }
+                    srv.platform = plat;
+                }
+                let sessions = client.attach_all().await?;
+                let adhoc = (srv.transport_kind != TransportKind::Local).then(|| HostItem {
+                    label: srv.host_label.clone(),
+                    endpoints: vec![srv.endpoint_display.clone()],
+                    is_local: false,
+                    is_adhoc: true,
+                });
+                Ok((srv, client, event_rx, sessions, adhoc))
+            }
+            .await;
+
+            match res {
+                Ok((server, client, event_rx, sessions, adhoc_item)) => {
+                    let _ = tx.send(InternalMsg::HostConnected {
+                        server,
+                        client,
+                        event_rx,
+                        sessions,
+                        adhoc_item,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(InternalMsg::HostConnectFailed(format!("{:#}", e)));
+                }
+            }
+        });
+
+        self.connecting = Some(ConnectingState {
+            description: desc,
+            task,
+        });
+    }
+
     fn find_session_by_query(&self, query: &str) -> Option<SessionSummary> {
         self.sessions
             .iter()
             .find(|s| s.session_id == query || s.label == query)
-            .or_else(|| {
-                self.sessions
-                    .iter()
-                    .find(|s| s.session_id.ends_with(query))
-            })
+            .or_else(|| self.sessions.iter().find(|s| s.session_id.ends_with(query)))
             .cloned()
     }
 
@@ -179,12 +403,12 @@ impl App {
             return;
         };
         let sid = sess.session_id.clone();
+        let host_label = self.server.host_label.clone();
         let client = self.client.clone();
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
-            // Attach briefly or read session.view (connection called attach_all, so session.view works!)
             if let Ok(view) = client.session_view(&sid).await {
-                let _ = tx.send(InternalMsg::SessionViewLoaded(view));
+                let _ = tx.send(InternalMsg::SessionViewLoaded { host_label, view });
             }
         });
     }
@@ -217,14 +441,12 @@ impl App {
                 }
                 Some(rex_ev) = self.event_rx.recv() => {
                     self.handle_rex_event(rex_ev).await;
-                    // Drain any immediately queued events before redrawing
                     while let Ok(more) = self.event_rx.try_recv() {
                         self.handle_rex_event(more).await;
                     }
                 }
                 Some((block_id, stream_ev)) = self.stream_rx.recv() => {
                     self.apply_block_stream_event(&block_id, stream_ev);
-                    // Batch-drain pending terminal output chunks for smooth high-throughput rendering
                     let mut budget = 256;
                     while budget > 0 {
                         match self.stream_rx.try_recv() {
@@ -242,7 +464,9 @@ impl App {
             }
         }
 
-        // Cleanly detach if exiting while attached
+        if let Some(conn) = self.connecting.take() {
+            conn.task.abort();
+        }
         if let AppMode::Attached(ref state) = self.mode {
             let _ = self.client.detach_session(&state.session_id).await;
         }
@@ -260,8 +484,10 @@ impl App {
 
     fn handle_internal_msg(&mut self, msg: InternalMsg) {
         match msg {
-            InternalMsg::SessionViewLoaded(view) => {
-                self.session_previews.insert(view.session_id.clone(), view);
+            InternalMsg::SessionViewLoaded { host_label, view } => {
+                if host_label == self.server.host_label {
+                    self.session_previews.insert(view.session_id.clone(), view);
+                }
             }
             InternalMsg::AttachedViewUpdated(view) => {
                 if let AppMode::Attached(ref mut state) = self.mode {
@@ -277,13 +503,66 @@ impl App {
             InternalMsg::StatusError(err) => {
                 self.status_msg = Some((err, true));
             }
+            InternalMsg::StatusInfo(info) => {
+                self.status_msg = Some((info, false));
+            }
+            InternalMsg::HostsReloaded(new_hosts) => {
+                self.merge_loaded_hosts(new_hosts);
+                if let ManagerModal::HostSwitcher { ref mut selected } = self.modal {
+                    if *selected >= self.hosts.len() {
+                        *selected = self.hosts.len().saturating_sub(1);
+                    }
+                }
+            }
+            InternalMsg::HostConnected {
+                server,
+                client,
+                event_rx,
+                sessions,
+                adhoc_item,
+            } => {
+                self.connecting = None;
+                self.mode = AppMode::SessionManager;
+                self.modal = ManagerModal::None;
+                let msg = format!(
+                    "已连接 [{}] {} ({})",
+                    server.transport_kind.badge(),
+                    server.host_label,
+                    server.endpoint_display
+                );
+                if let Some(adhoc) = adhoc_item {
+                    if !self
+                        .hosts
+                        .iter()
+                        .any(|h| h.label.eq_ignore_ascii_case(&adhoc.label))
+                    {
+                        self.hosts.push(adhoc);
+                    }
+                }
+                self.server = server;
+                self.client = client;
+                self.event_rx = event_rx;
+                self.sessions = sessions;
+                self.selected_idx = 0;
+                self.session_previews.clear();
+                self.status_msg = Some((msg, false));
+                self.request_selected_preview();
+            }
+            InternalMsg::HostConnectFailed(err) => {
+                self.connecting = None;
+                self.status_msg = Some((err, true));
+            }
         }
     }
 
     async fn handle_rex_event(&mut self, ev: RexEvent) {
         match ev {
             RexEvent::SessionCreated(summary) => {
-                if !self.sessions.iter().any(|s| s.session_id == summary.session_id) {
+                if !self
+                    .sessions
+                    .iter()
+                    .any(|s| s.session_id == summary.session_id)
+                {
                     self.sessions.push(summary);
                 }
                 self.request_selected_preview();
@@ -312,6 +591,9 @@ impl App {
                     self.clamp_selection();
                 }
             }
+            RexEvent::HostsChanged => {
+                self.reload_hosts_bg();
+            }
             RexEvent::SessionLabelChanged { session_id, label } => {
                 for s in &mut self.sessions {
                     if s.session_id == session_id {
@@ -327,32 +609,36 @@ impl App {
                     }
                 }
             }
-            RexEvent::SessionViewChanged { session_id, revision } => {
-                match &self.mode {
-                    AppMode::Attached(st) if st.session_id == session_id => {
-                        if revision > st.view.revision {
-                            let client = self.client.clone();
-                            let tx = self.internal_tx.clone();
-                            tokio::spawn(async move {
-                                if let Ok(v) = client.session_view(&session_id).await {
-                                    let _ = tx.send(InternalMsg::AttachedViewUpdated(v));
-                                }
-                            });
-                        }
+            RexEvent::SessionViewChanged {
+                session_id,
+                revision,
+            } => match &self.mode {
+                AppMode::Attached(st) if st.session_id == session_id => {
+                    if revision > st.view.revision {
+                        let client = self.client.clone();
+                        let tx = self.internal_tx.clone();
+                        tokio::spawn(async move {
+                            if let Ok(v) = client.session_view(&session_id).await {
+                                let _ = tx.send(InternalMsg::AttachedViewUpdated(v));
+                            }
+                        });
                     }
-                    AppMode::SessionManager => {
-                        if self
-                            .selected_session()
-                            .map(|s| s.session_id == session_id)
-                            .unwrap_or(false)
-                        {
-                            self.request_selected_preview();
-                        }
-                    }
-                    _ => {}
                 }
-            }
-            RexEvent::BlockClosed { session_id, block_id } => {
+                AppMode::SessionManager => {
+                    if self
+                        .selected_session()
+                        .map(|s| s.session_id == session_id)
+                        .unwrap_or(false)
+                    {
+                        self.request_selected_preview();
+                    }
+                }
+                _ => {}
+            },
+            RexEvent::BlockClosed {
+                session_id,
+                block_id,
+            } => {
                 if let AppMode::Attached(ref mut st) = self.mode {
                     if st.session_id == session_id {
                         st.panes.remove(&block_id);
@@ -388,7 +674,13 @@ impl App {
             }
             RexEvent::Disconnected(reason) => {
                 self.mode = AppMode::SessionManager;
-                self.status_msg = Some((format!("与本地 Rex Server 断开连接: {}", reason), true));
+                self.status_msg = Some((
+                    format!(
+                        "与主机 {} ({}) 断开连接: {}（按 s 可重新选择或重连主机）",
+                        self.server.host_label, self.server.endpoint_display, reason
+                    ),
+                    true,
+                ));
             }
         }
     }
@@ -445,7 +737,6 @@ impl App {
 
         let placements = compute_window_panes(&win, pane_area);
 
-        // Ensure ownership, PTY dimensions, and live data stream match each visible terminal pane
         for p in placements {
             if p.summary.creator_name != "com.superlogical.terminal" {
                 continue;
@@ -466,11 +757,7 @@ impl App {
                         let _ = client.own_blocks(&sid, std::slice::from_ref(&bid)).await;
                     }
                     let _ = client.terminal_resize(&sid, &bid, cols, rows).await;
-                    if let Ok(inner_join) =
-                        spawn_terminal_stream(client, sid, bid, stream_tx).await
-                    {
-                        let _ = inner_join.await;
-                    }
+                    let _ = run_terminal_stream(client, sid, bid, stream_tx).await;
                 });
                 pane.task_handle = Some(join);
                 state.panes.insert(p.block_id.clone(), pane);
@@ -495,7 +782,6 @@ impl App {
     async fn handle_crossterm_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) => {
-                // Ignore key release events on terminals supporting kitty keyboard enhancements
                 if key.kind == KeyEventKind::Release {
                     return;
                 }
@@ -522,6 +808,7 @@ impl App {
                             }
                             let encoded = encode_paste_to_vt(&text, bracketed);
                             let _ = self.write_tx.send((
+                                self.client.clone(),
                                 state.session_id.clone(),
                                 bid.clone(),
                                 encoded,
@@ -529,12 +816,26 @@ impl App {
                         }
                     }
                 } else {
+                    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
                     match &mut self.modal {
                         ManagerModal::NewSession { input, .. }
                         | ManagerModal::RenameSession { input, .. } => {
-                            let clean: String =
-                                text.chars().filter(|c| !c.is_control()).collect();
                             input.push_str(&clean);
+                        }
+                        ManagerModal::QuickConnect { endpoint } => {
+                            endpoint.push_str(&clean);
+                        }
+                        ManagerModal::AddHost {
+                            label,
+                            endpoint,
+                            focus_field,
+                            ..
+                        } => {
+                            if *focus_field == 0 {
+                                label.push_str(&clean);
+                            } else {
+                                endpoint.push_str(&clean);
+                            }
                         }
                         _ => {}
                     }
@@ -561,7 +862,6 @@ impl App {
                         }
                         return;
                     }
-                    // Click on top tab bar switches window
                     if mev.row == 0 {
                         for (x0, x1, wid) in &state.tab_hitboxes {
                             if mev.column >= *x0 && mev.column < *x1 {
@@ -575,9 +875,7 @@ impl App {
                             }
                         }
                     } else {
-                        // Click inside an unfocused pane focuses it
                         let placements = self.compute_active_placements();
-                        // Iterate in reverse so floating layers on top win hit-testing
                         for p in placements.iter().rev() {
                             let r = p.outer_rect;
                             if mev.column >= r.x
@@ -596,6 +894,22 @@ impl App {
                                     }
                                 }
                                 break;
+                            }
+                        }
+                    }
+                } else if matches!(self.modal, ManagerModal::None) && self.connecting.is_none() {
+                    // Click on Host Bar (row 3) switches host
+                    if mev.row == 3 {
+                        if let Some((_, _, idx)) = self
+                            .host_hitboxes
+                            .iter()
+                            .find(|(x0, x1, _)| mev.column >= *x0 && mev.column < *x1)
+                            .cloned()
+                        {
+                            if idx != self.active_host_index() {
+                                if let Some(item) = self.hosts.get(idx).cloned() {
+                                    self.start_connect_host_item(item);
+                                }
                             }
                         }
                     }
@@ -646,7 +960,19 @@ impl App {
     }
 
     async fn handle_manager_key(&mut self, key: KeyEvent) {
-        // Global Ctrl+C in manager quits cleanly (or cancels modal)
+        // Allow canceling an in-flight async host connection with Esc or Ctrl+C
+        if self.connecting.is_some() {
+            if key.code == KeyCode::Esc
+                || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+            {
+                if let Some(conn) = self.connecting.take() {
+                    conn.task.abort();
+                }
+                self.status_msg = Some(("已取消主机连接".into(), false));
+            }
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if !matches!(self.modal, ManagerModal::None) {
                 self.modal = ManagerModal::None;
@@ -656,10 +982,260 @@ impl App {
             return;
         }
 
-        // Modal input handling first
         match self.modal.clone() {
             ManagerModal::Help => {
                 self.modal = ManagerModal::None;
+                return;
+            }
+            ManagerModal::HostSwitcher { mut selected } => {
+                let count = self.hosts.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.modal = ManagerModal::None;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if count > 0 {
+                            selected = (selected + 1) % count;
+                            self.modal = ManagerModal::HostSwitcher { selected };
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if count > 0 {
+                            selected = if selected == 0 { count - 1 } else { selected - 1 };
+                            self.modal = ManagerModal::HostSwitcher { selected };
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(item) = self.hosts.get(selected).cloned() {
+                            self.modal = ManagerModal::None;
+                            self.start_connect_host_item(item);
+                        }
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('n') => {
+                        self.modal = ManagerModal::AddHost {
+                            label: String::new(),
+                            endpoint: String::new(),
+                            focus_field: 0,
+                            connect_now: true,
+                        };
+                    }
+                    KeyCode::Char('c') => {
+                        self.modal = ManagerModal::QuickConnect {
+                            endpoint: String::new(),
+                        };
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
+                        if let Some(item) = self.hosts.get(selected).cloned() {
+                            if item.is_local {
+                                self.status_msg = Some(("本机 (local) 不可删除".into(), true));
+                            } else {
+                                self.modal = ManagerModal::ConfirmDeleteHost {
+                                    label: item.label,
+                                    is_adhoc: item.is_adhoc,
+                                };
+                            }
+                        }
+                    }
+                    KeyCode::Char('R') => {
+                        self.reload_hosts_bg();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            ManagerModal::AddHost {
+                mut label,
+                mut endpoint,
+                mut focus_field,
+                mut connect_now,
+            } => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+                    connect_now = !connect_now;
+                    self.modal = ManagerModal::AddHost {
+                        label,
+                        endpoint,
+                        focus_field,
+                        connect_now,
+                    };
+                    return;
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+                    if focus_field == 0 {
+                        label.clear();
+                    } else {
+                        endpoint.clear();
+                    }
+                    self.modal = ManagerModal::AddHost {
+                        label,
+                        endpoint,
+                        focus_field,
+                        connect_now,
+                    };
+                    return;
+                }
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal = ManagerModal::HostSwitcher {
+                            selected: self.active_host_index(),
+                        };
+                    }
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                        focus_field = if focus_field == 0 { 1 } else { 0 };
+                        self.modal = ManagerModal::AddHost {
+                            label,
+                            endpoint,
+                            focus_field,
+                            connect_now,
+                        };
+                    }
+                    KeyCode::Backspace => {
+                        if focus_field == 0 {
+                            label.pop();
+                        } else {
+                            endpoint.pop();
+                        }
+                        self.modal = ManagerModal::AddHost {
+                            label,
+                            endpoint,
+                            focus_field,
+                            connect_now,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        if focus_field == 0 && endpoint.trim().is_empty() {
+                            focus_field = 1;
+                            self.modal = ManagerModal::AddHost {
+                                label,
+                                endpoint,
+                                focus_field,
+                                connect_now,
+                            };
+                            return;
+                        }
+                        let eps: Vec<String> = endpoint
+                            .split(|c: char| c.is_whitespace() || c == ',')
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .collect();
+                        let lbl = label.trim().to_string();
+                        match add_rex_host(&lbl, &eps).await {
+                            Ok(()) => {
+                                let new_item = HostItem {
+                                    label: lbl.clone(),
+                                    endpoints: eps,
+                                    is_local: false,
+                                    is_adhoc: false,
+                                };
+                                self.merge_loaded_hosts(load_host_items().await);
+                                if !self
+                                    .hosts
+                                    .iter()
+                                    .any(|h| h.label.eq_ignore_ascii_case(&lbl))
+                                {
+                                    self.hosts.push(new_item.clone());
+                                }
+                                if connect_now {
+                                    self.modal = ManagerModal::None;
+                                    self.start_connect_host_item(new_item);
+                                } else {
+                                    let idx = self
+                                        .hosts
+                                        .iter()
+                                        .position(|h| h.label.eq_ignore_ascii_case(&lbl))
+                                        .unwrap_or(0);
+                                    self.modal = ManagerModal::HostSwitcher { selected: idx };
+                                    self.status_msg =
+                                        Some((format!("已保存主机 \"{}\"", lbl), false));
+                                }
+                            }
+                            Err(e) => {
+                                self.status_msg = Some((format!("添加主机失败: {}", e), true));
+                            }
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        if focus_field == 0 {
+                            label.push(c);
+                        } else {
+                            endpoint.push(c);
+                        }
+                        self.modal = ManagerModal::AddHost {
+                            label,
+                            endpoint,
+                            focus_field,
+                            connect_now,
+                        };
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            ManagerModal::QuickConnect { mut endpoint } => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+                    endpoint.clear();
+                    self.modal = ManagerModal::QuickConnect { endpoint };
+                    return;
+                }
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal = ManagerModal::None;
+                    }
+                    KeyCode::Backspace => {
+                        endpoint.pop();
+                        self.modal = ManagerModal::QuickConnect { endpoint };
+                    }
+                    KeyCode::Enter => {
+                        if !endpoint.trim().is_empty() {
+                            self.modal = ManagerModal::None;
+                            self.start_connect_adhoc(endpoint);
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        endpoint.push(c);
+                        self.modal = ManagerModal::QuickConnect { endpoint };
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            ManagerModal::ConfirmDeleteHost { label, is_adhoc } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        if is_adhoc {
+                            self.hosts
+                                .retain(|h| !h.label.eq_ignore_ascii_case(&label));
+                            self.modal = ManagerModal::HostSwitcher { selected: 0 };
+                            self.status_msg =
+                                Some((format!("已移除临时主机 \"{}\"", label), false));
+                        } else {
+                            match remove_rex_host(&label).await {
+                                Ok(()) => {
+                                    self.merge_loaded_hosts(load_host_items().await);
+                                    self.modal = ManagerModal::HostSwitcher { selected: 0 };
+                                    self.status_msg =
+                                        Some((format!("已移除主机 \"{}\"", label), false));
+                                }
+                                Err(e) => {
+                                    self.modal = ManagerModal::HostSwitcher { selected: 0 };
+                                    self.status_msg =
+                                        Some((format!("移除主机失败: {}", e), true));
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.modal = ManagerModal::HostSwitcher {
+                            selected: self.active_host_index(),
+                        };
+                    }
+                    _ => {}
+                }
                 return;
             }
             ManagerModal::NewSession {
@@ -892,13 +1468,48 @@ impl App {
                     };
                 }
             }
+            // Multi-host management & quick switching
+            KeyCode::Char('s') | KeyCode::Char('H') => {
+                let sel = self.active_host_index();
+                self.reload_hosts_bg();
+                self.modal = ManagerModal::HostSwitcher { selected: sel };
+            }
+            KeyCode::Char('c') => {
+                self.modal = ManagerModal::QuickConnect {
+                    endpoint: String::new(),
+                };
+            }
+            KeyCode::Char(']') => {
+                if self.hosts.len() > 1 {
+                    let next = (self.active_host_index() + 1) % self.hosts.len();
+                    if let Some(item) = self.hosts.get(next).cloned() {
+                        self.start_connect_host_item(item);
+                    }
+                }
+            }
+            KeyCode::Char('[') => {
+                if self.hosts.len() > 1 {
+                    let cur = self.active_host_index();
+                    let prev = if cur == 0 {
+                        self.hosts.len() - 1
+                    } else {
+                        cur - 1
+                    };
+                    if let Some(item) = self.hosts.get(prev).cloned() {
+                        self.start_connect_host_item(item);
+                    }
+                }
+            }
             KeyCode::Char('R') => {
+                self.reload_hosts_bg();
                 match self.client.list_sessions().await {
                     Ok(list) => {
                         self.sessions = list;
                         self.clamp_selection();
                         self.request_selected_preview();
-                        self.status_msg = Some(("已刷新会话列表".into(), false));
+                        let _ = self.internal_tx.send(InternalMsg::StatusInfo(
+                            "已刷新会话与主机列表".into(),
+                        ));
                     }
                     Err(e) => {
                         self.status_msg = Some((format!("刷新失败: {}", e), true));
@@ -918,15 +1529,12 @@ impl App {
             return;
         };
 
-        // 1. Dismiss help overlay on Esc / q / ? / Enter
         if state.show_help {
             state.show_help = false;
             return;
         }
 
-        // 2. Scrollback browsing mode (`Ctrl-b [`)
         if state.scroll_mode && !state.prefix_active {
-            // Allow `Ctrl-b` inside scroll mode too
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('b') {
                 state.prefix_active = true;
                 return;
@@ -952,7 +1560,16 @@ impl App {
                         }
                         _ => {}
                     }
-                    if pane.parser.screen().scrollback() == 0 && matches!(key.code, KeyCode::Down | KeyCode::PageDown | KeyCode::Char('j') | KeyCode::Char('f') | KeyCode::Char('d')) {
+                    if pane.parser.screen().scrollback() == 0
+                        && matches!(
+                            key.code,
+                            KeyCode::Down
+                                | KeyCode::PageDown
+                                | KeyCode::Char('j')
+                                | KeyCode::Char('f')
+                                | KeyCode::Char('d')
+                        )
+                    {
                         state.scroll_mode = false;
                     }
                 } else {
@@ -964,7 +1581,6 @@ impl App {
             return;
         }
 
-        // 3. Prefix key (`Ctrl-b`) trigger
         if !state.prefix_active
             && key.modifiers == KeyModifiers::CONTROL
             && (key.code == KeyCode::Char('b') || key.code == KeyCode::Char('B'))
@@ -973,13 +1589,11 @@ impl App {
             return;
         }
 
-        // 4. Handle command following `Ctrl-b` prefix
         if state.prefix_active {
             state.prefix_active = false;
             let sid = state.session_id.clone();
             let client = self.client.clone();
 
-            // `Ctrl-b Ctrl-b` -> send literal Ctrl-b (\x02) to focused terminal
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && (key.code == KeyCode::Char('b') || key.code == KeyCode::Char('B'))
             {
@@ -988,7 +1602,6 @@ impl App {
             }
 
             match key.code {
-                // Detach back to Session Manager
                 KeyCode::Char('d') => {
                     let label = if state.view.label.is_empty() {
                         sid.clone()
@@ -1004,10 +1617,10 @@ impl App {
                         }
                         self.clamp_selection();
                     }
-                    self.status_msg = Some((format!("已从会话 \"{}\" 分离 (Detached)", label), false));
+                    self.status_msg =
+                        Some((format!("已从会话 \"{}\" 分离 (Detached)", label), false));
                     self.request_selected_preview();
                 }
-                // Window navigation
                 KeyCode::Char('n') | KeyCode::Tab => {
                     tokio::spawn(async move {
                         let _ = client.focus_next_window(&sid).await;
@@ -1027,7 +1640,6 @@ impl App {
                         });
                     }
                 }
-                // Directional & cycle Pane focus navigation
                 KeyCode::Left | KeyCode::Char('h') => {
                     tokio::spawn(async move {
                         let _ = client.focus_direction(&sid, "left").await;
@@ -1058,7 +1670,6 @@ impl App {
                         let _ = client.focus_previous_pane(&sid).await;
                     });
                 }
-                // Zoom toggle on focused pane
                 KeyCode::Char('z') => {
                     if let Some(win) = state.view.active_window() {
                         if let Some(ref bid) = win.focused_block_id {
@@ -1070,7 +1681,6 @@ impl App {
                         }
                     }
                 }
-                // Enter scrollback mode
                 KeyCode::Char('[') | KeyCode::PageUp => {
                     state.scroll_mode = true;
                     if matches!(key.code, KeyCode::PageUp) {
@@ -1085,7 +1695,6 @@ impl App {
                         }
                     }
                 }
-                // Toggle help overlay
                 KeyCode::Char('?') => {
                     state.show_help = !state.show_help;
                 }
@@ -1095,7 +1704,6 @@ impl App {
             return;
         }
 
-        // 5. Normal key -> encode VT sequence and forward to focused terminal block
         let app_cursor = state
             .view
             .active_window()
@@ -1123,6 +1731,7 @@ impl App {
             pane.reset_scrollback();
         }
         let _ = self.write_tx.send((
+            self.client.clone(),
             state.session_id.clone(),
             bid.clone(),
             data.to_string(),

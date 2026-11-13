@@ -182,11 +182,30 @@ pub struct TerminalBlobReadResponse {
     pub eof: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerStatusResponse {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    #[serde(default)]
+    pub session_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerVersionResponse {
+    #[serde(default)]
+    pub rex_version: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum RexEvent {
     SessionCreated(SessionSummary),
     SessionDestroyed { session_id: String },
     SessionsChanged,
+    HostsChanged,
     SessionLabelChanged { session_id: String, label: String },
     SessionViewChanged { session_id: String, revision: u64 },
     BlockClosed { session_id: String, block_id: String },
@@ -220,6 +239,7 @@ impl RexEvent {
             "session_moved" | "sessions_reordered" | "session_label_changed" | "session_updated" => {
                 Some(RexEvent::SessionsChanged)
             }
+            "hosts_changed" => Some(RexEvent::HostsChanged),
             "session_event" => {
                 let sid = payload.get("session_id")?.as_str()?.to_string();
                 let inner = payload.get("event")?;

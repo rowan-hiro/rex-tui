@@ -1,8 +1,8 @@
 [package]
 name = "rex-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "TUI client for managing and attaching to local Rex sessions"
+description = "TUI client for managing and attaching to local and remote Rex sessions (Unix, HTTP, SSH)"
 
 [dependencies]
 anyhow = "1"

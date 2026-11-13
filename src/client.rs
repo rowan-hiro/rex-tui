@@ -1,7 +1,8 @@
+use crate::discovery::ConnectTarget;
 use crate::types::{
     AttachSessionResponse, CreateSessionResponse, DataTicketResponse, RexEvent, RexRpcError,
-    SessionListResponse, SessionSummary, SessionView, TerminalBlobReadResponse,
-    TerminalFormatResponse, WelcomeEnvelope,
+    ServerStatusResponse, ServerVersionResponse, SessionListResponse, SessionSummary, SessionView,
+    TerminalBlobReadResponse, TerminalFormatResponse, WelcomeEnvelope,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -10,30 +11,68 @@ use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::net::UnixStream;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::handshake::client::{generate_key, Request};
 use tokio_tungstenite::tungstenite::Message;
 
-fn build_ws_request(uri: &str, subprotocol: &str) -> Result<Request> {
-    Request::builder()
-        .uri(uri)
-        .header("Host", "localhost")
+pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
+pub type BoxedStream = Pin<Box<dyn IoStream>>;
+
+async fn open_target_ws(
+    target: &ConnectTarget,
+    api_path: &str,
+    subprotocol: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<BoxedStream>> {
+    let (stream, host_header): (BoxedStream, String) = match target {
+        ConnectTarget::Unix(path) => {
+            let s = UnixStream::connect(path)
+                .await
+                .with_context(|| format!("无法连接 Unix Socket: {}", path.display()))?;
+            (Box::pin(s), "localhost".to_string())
+        }
+        ConnectTarget::Tcp { addr, host_header } => {
+            let s = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+                .await
+                .with_context(|| format!("连接 HTTP 服务超时: {}", addr))?
+                .with_context(|| format!("无法连接 HTTP 服务: {}", addr))?;
+            let _ = s.set_nodelay(true);
+            (Box::pin(s), host_header.clone())
+        }
+    };
+
+    let uri = format!("ws://{}{}", host_header, api_path);
+    let req = Request::builder()
+        .uri(&uri)
+        .header("Host", &host_header)
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
         .header("Sec-WebSocket-Key", generate_key())
         .header("Sec-WebSocket-Protocol", subprotocol)
         .body(())
-        .context("failed to build WebSocket upgrade request")
+        .context("构建 WebSocket 握手请求失败")?;
+
+    let (ws, _resp) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::client_async(req, stream),
+    )
+    .await
+    .with_context(|| format!("WebSocket 握手超时 ({})", api_path))?
+    .with_context(|| format!("WebSocket 握手失败 ({})", api_path))?;
+
+    Ok(ws)
 }
 
 #[derive(Clone)]
 pub struct RexClient {
-    socket_path: PathBuf,
+    target: ConnectTarget,
     next_id: Arc<AtomicU64>,
     outbound_tx: mpsc::UnboundedSender<String>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>>,
@@ -41,16 +80,9 @@ pub struct RexClient {
 
 impl RexClient {
     pub async fn connect(
-        socket_path: PathBuf,
+        target: ConnectTarget,
     ) -> Result<(Self, mpsc::UnboundedReceiver<RexEvent>)> {
-        let stream = UnixStream::connect(&socket_path)
-            .await
-            .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-
-        let req = build_ws_request("ws://localhost/api/control", "rex.control.v1")?;
-        let (mut ws, _resp) = tokio_tungstenite::client_async(req, stream)
-            .await
-            .context("WebSocket handshake failed on /api/control")?;
+        let mut ws = open_target_ws(&target, "/api/control", "rex.control.v1").await?;
 
         let hello = json!({
             "type": "hello",
@@ -69,11 +101,11 @@ impl RexClient {
 
         // Read welcome message
         let welcome_env = loop {
-            let msg = ws
-                .next()
+            let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
                 .await
-                .ok_or_else(|| anyhow!("server closed connection before sending welcome"))?
-                .context("error reading welcome from server")?;
+                .context("等待服务端 welcome 超时")?
+                .ok_or_else(|| anyhow!("服务端在发送 welcome 前关闭了连接"))?
+                .context("读取服务端 welcome 失败")?;
             match msg {
                 Message::Text(txt) => {
                     let v: Value =
@@ -88,7 +120,7 @@ impl RexClient {
                     let reason = frame
                         .map(|f| format!("{} ({})", f.reason, f.code))
                         .unwrap_or_else(|| "closed".to_string());
-                    return Err(anyhow!("server rejected connection: {}", reason));
+                    return Err(anyhow!("服务端拒绝连接: {}", reason));
                 }
                 _ => {}
             }
@@ -109,7 +141,7 @@ impl RexClient {
             Arc::new(Mutex::new(HashMap::new()));
         let pending_reader = Arc::clone(&pending);
 
-        // Writer task
+        // Writer task: exits and closes the WebSocket as soon as all `RexClient` handles drop
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -118,12 +150,19 @@ impl RexClient {
                             break;
                         }
                     }
-                    Some(text) = outbound_rx.recv() => {
-                        if ws_sink.send(Message::Text(text.into())).await.is_err() {
-                            break;
+                    maybe_text = outbound_rx.recv() => {
+                        match maybe_text {
+                            Some(text) => {
+                                if ws_sink.send(Message::Text(text.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => {
+                                let _ = ws_sink.close().await;
+                                break;
+                            }
                         }
                     }
-                    else => break,
                 }
             }
         });
@@ -195,7 +234,7 @@ impl RexClient {
         });
 
         let client = Self {
-            socket_path,
+            target,
             next_id: Arc::new(AtomicU64::new(1)),
             outbound_tx,
             pending,
@@ -204,8 +243,8 @@ impl RexClient {
         Ok((client, event_rx))
     }
 
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+    pub fn target(&self) -> &ConnectTarget {
+        &self.target
     }
 
     pub async fn call_raw(&self, method: &str, payload: Value) -> Result<Value> {
@@ -233,6 +272,27 @@ impl RexClient {
         let val = self.call_raw(method, payload).await?;
         serde_json::from_value(val)
             .with_context(|| format!("failed to decode response for {}", method))
+    }
+
+    pub async fn fetch_server_metadata(
+        &self,
+    ) -> (Option<u32>, Option<String>, Option<String>) {
+        let status_fut = self.call::<ServerStatusResponse>("server.status", json!({}));
+        let ver_fut = self.call::<ServerVersionResponse>("server.version", json!({}));
+        let (st, ver) = tokio::join!(status_fut, ver_fut);
+        let pid = st.ok().and_then(|s| s.pid);
+        let (rex_ver, platform) = match ver {
+            Ok(v) => (
+                (!v.rex_version.as_deref().unwrap_or("").is_empty())
+                    .then_some(v.rex_version)
+                    .flatten(),
+                (!v.platform.as_deref().unwrap_or("").is_empty())
+                    .then_some(v.platform)
+                    .flatten(),
+            ),
+            Err(_) => (None, None),
+        };
+        (pid, rex_ver, platform)
     }
 
     pub async fn attach_all(&self) -> Result<Vec<SessionSummary>> {
@@ -403,7 +463,12 @@ impl RexClient {
         Ok(())
     }
 
-    pub async fn toggle_zoom_block(&self, session_id: &str, block_id: &str, zoomed: bool) -> Result<()> {
+    pub async fn toggle_zoom_block(
+        &self,
+        session_id: &str,
+        block_id: &str,
+        zoomed: bool,
+    ) -> Result<()> {
         let _ = self
             .call_raw(
                 "session.zoom_block",
@@ -482,12 +547,10 @@ impl RexClient {
             )
             .await?;
 
-        // If scrollback + screen fits in one chunk, return directly
         let Some(blob_id) = resp.id else {
             return Ok(resp.content);
         };
 
-        // Otherwise read the tail of the formatted VT output (last ~256 KiB) so screen + recent scrollback are intact
         let total = resp.total.unwrap_or(resp.content.len());
         let tail_window = 262_144usize;
         let mut offset = if total > tail_window {
@@ -596,7 +659,6 @@ impl ApcStreamFilter {
                 self.skipping_snapshot = false;
                 snapshot_just_ended = true;
             } else {
-                // Keep only enough tail bytes to match a split prefix across chunks
                 let keep = self.prefix.len().saturating_sub(1);
                 if self.buf.len() > keep {
                     let drain_to = self.buf.len() - keep;
@@ -615,19 +677,22 @@ impl ApcStreamFilter {
                     let vt_bytes: Vec<u8> = self.buf.drain(..pos).collect();
                     out.push(TerminalStreamEvent::Output(vt_bytes));
                 }
-                // Now self.buf starts with self.prefix; look for ST (`ESC \`)
                 let body_start = self.prefix.len();
                 if let Some(st_rel) = find_subslice(&self.buf[body_start..], b"\x1b\\") {
                     let json_end = body_start + st_rel;
-                    if let Ok(v) = serde_json::from_slice::<Value>(&self.buf[body_start..json_end]) {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&self.buf[body_start..json_end])
+                    {
                         match v.get("type").and_then(|t| t.as_str()) {
                             Some("resize") => {
-                                let cols = v.get("cols").and_then(|c| c.as_u64()).unwrap_or(80) as u16;
-                                let rows = v.get("rows").and_then(|r| r.as_u64()).unwrap_or(24) as u16;
+                                let cols =
+                                    v.get("cols").and_then(|c| c.as_u64()).unwrap_or(80) as u16;
+                                let rows =
+                                    v.get("rows").and_then(|r| r.as_u64()).unwrap_or(24) as u16;
                                 out.push(TerminalStreamEvent::Resized { cols, rows });
                             }
                             Some("child_exited") => {
-                                let code = v.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0) as i32;
+                                let code =
+                                    v.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0) as i32;
                                 out.push(TerminalStreamEvent::ChildExited { exit_code: code });
                             }
                             _ => {}
@@ -635,7 +700,6 @@ impl ApcStreamFilter {
                     }
                     self.buf.drain(..json_end + 2);
                 } else {
-                    // Wait for more bytes to complete the APC frame (unless anomalously huge)
                     if self.buf.len() > 65536 {
                         let dumped: Vec<u8> = self.buf.drain(..).collect();
                         out.push(TerminalStreamEvent::Output(dumped));
@@ -643,7 +707,6 @@ impl ApcStreamFilter {
                     break;
                 }
             } else {
-                // Check if the end of `self.buf` might be the start of `self.prefix`
                 let partial = trailing_prefix_overlap(&self.buf, &self.prefix);
                 let emit_len = self.buf.len() - partial;
                 if emit_len > 0 {
@@ -675,21 +738,14 @@ fn trailing_prefix_overlap(buf: &[u8], prefix: &[u8]) -> usize {
     0
 }
 
-pub async fn spawn_terminal_stream(
+pub async fn run_terminal_stream(
     client: RexClient,
     session_id: String,
     block_id: String,
     tx: mpsc::UnboundedSender<(String, TerminalStreamEvent)>,
-) -> Result<tokio::task::JoinHandle<()>> {
-    // 1. Obtain initial formatted VT screen + ticket
+) -> Result<()> {
     let ticket = client.data_connect_terminal(&session_id, &block_id).await?;
-    let stream = UnixStream::connect(client.socket_path())
-        .await
-        .context("failed to connect Unix socket for /api/data")?;
-    let req = build_ws_request("ws://localhost/api/data", "rex.data.terminal.v1")?;
-    let (mut ws, _) = tokio_tungstenite::client_async(req, stream)
-        .await
-        .context("WebSocket handshake failed on /api/data")?;
+    let mut ws = open_target_ws(client.target(), "/api/data", "rex.data.terminal.v1").await?;
 
     // Send 17-byte HELLO: 0x01 + 16 ticket bytes
     let mut hello = Vec::with_capacity(17);
@@ -699,11 +755,10 @@ pub async fn spawn_terminal_stream(
         .await
         .context("failed to send data HELLO")?;
 
-    // Read WELCOME (32 bytes starting with 0x81) or REJECT (2 bytes starting with 0x82)
     let nonce = loop {
-        let msg = ws
-            .next()
+        let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
             .await
+            .context("data stream WELCOME timed out")?
             .ok_or_else(|| anyhow!("data stream closed before WELCOME"))?
             .context("error reading data WELCOME")?;
         match msg {
@@ -726,75 +781,72 @@ pub async fn spawn_terminal_stream(
         }
     };
 
-    let handle = tokio::spawn(async move {
-        let mut filter = ApcStreamFilter::new(nonce);
-        let mut early_exit: Option<i32> = None;
+    let mut filter = ApcStreamFilter::new(nonce);
+    let mut early_exit: Option<i32> = None;
 
-        // 1. Consume the initial Ghostty binary snapshot up to the first `resize` APC marker
-        while filter.is_skipping_snapshot() {
-            match ws.next().await {
-                Some(Ok(Message::Binary(chunk))) => {
-                    let (_ended, events) = filter.push(&chunk);
-                    for ev in events {
-                        if let TerminalStreamEvent::ChildExited { exit_code } = ev {
-                            early_exit = Some(exit_code);
-                        }
+    // 1. Consume the initial Ghostty binary snapshot up to the first `resize` APC marker
+    while filter.is_skipping_snapshot() {
+        match ws.next().await {
+            Some(Ok(Message::Binary(chunk))) => {
+                let (_ended, events) = filter.push(&chunk);
+                for ev in events {
+                    if let TerminalStreamEvent::ChildExited { exit_code } = ev {
+                        early_exit = Some(exit_code);
                     }
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                    let _ = tx.send((block_id, TerminalStreamEvent::Closed));
-                    return;
-                }
-                _ => {}
             }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                let _ = tx.send((block_id, TerminalStreamEvent::Closed));
+                return Ok(());
+            }
+            _ => {}
         }
+    }
 
-        // 2. Seed `vt100::Parser` with full screen + cursor + styles + modes via `terminal.format(vt)`
-        if let Ok(vt_str) = client.terminal_format_vt(&session_id, &block_id).await {
-            if tx
-                .send((
-                    block_id.clone(),
-                    TerminalStreamEvent::InitialVt(vt_str.into_bytes()),
-                ))
-                .is_err()
-            {
-                let _ = ws.close(None).await;
-                return;
-            }
-        }
-        if let Some(code) = early_exit {
-            let _ = tx.send((
+    // 2. Seed `vt100::Parser` with full screen + cursor + styles + modes via `terminal.format(vt)`
+    if let Ok(vt_str) = client.terminal_format_vt(&session_id, &block_id).await {
+        if tx
+            .send((
                 block_id.clone(),
-                TerminalStreamEvent::ChildExited { exit_code: code },
-            ));
+                TerminalStreamEvent::InitialVt(vt_str.into_bytes()),
+            ))
+            .is_err()
+        {
+            let _ = ws.close(None).await;
+            return Ok(());
         }
+    }
+    if let Some(code) = early_exit {
+        let _ = tx.send((
+            block_id.clone(),
+            TerminalStreamEvent::ChildExited { exit_code: code },
+        ));
+    }
 
-        // 3. Stream all live VT output and APC lifecycle events
-        while let Some(msg_res) = ws.next().await {
-            match msg_res {
-                Ok(Message::Binary(chunk)) => {
-                    let (_snap_ended, events) = filter.push(&chunk);
-                    for ev in events {
-                        if tx.send((block_id.clone(), ev)).is_err() {
-                            let _ = ws.close(None).await;
-                            return;
-                        }
+    // 3. Stream all live VT output and APC lifecycle events
+    while let Some(msg_res) = ws.next().await {
+        match msg_res {
+            Ok(Message::Binary(chunk)) => {
+                let (_snap_ended, events) = filter.push(&chunk);
+                for ev in events {
+                    if tx.send((block_id.clone(), ev)).is_err() {
+                        let _ = ws.close(None).await;
+                        return Ok(());
                     }
                 }
-                Ok(Message::Ping(p)) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
             }
+            Ok(Message::Ping(p)) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => {}
         }
-        let _ = tx.send((block_id, TerminalStreamEvent::Closed));
-    });
-
-    Ok(handle)
+    }
+    let _ = tx.send((block_id, TerminalStreamEvent::Closed));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -806,7 +858,6 @@ mod tests {
         let nonce = 123456789u64;
         let mut filter = ApcStreamFilter::new(nonce);
 
-        // Simulated binary Ghostty snapshot split across chunks, followed by resize APC, then VT text, then child_exited APC
         let part1 = b"\x00\xffGHOSTTY_SNAPSHOT_BYTES\x1b_rex1;";
         let part2 = b"123456789;{\"type\":\"resize\",\"cols\":100,\"rows\":30}\x1b\\hello ";
         let part3 = b"\x1b[32mworld\x1b[0m\x1b_rex1;123456789;{\"type\":\"child_exited\",\"exit_code\":42}\x1b\\!";
